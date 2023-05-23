@@ -2,6 +2,7 @@ use std::{cmp, str, borrow::Cow};
 
 #[derive(Debug, Clone)]
 pub struct DecodeError<'input> {
+    pub valid_byte_sum: usize,
     pub invalid_sequence: Cow<'input, [u8]>,
     pub remaining_input: &'input [u8],
 }
@@ -10,8 +11,9 @@ impl<'a> std::fmt::Display for DecodeError<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "found invalid byte sequence {:02x?} followed by {} more unprocessed bytes",
+            "found invalid byte sequence {:02x?} after {} valid bytes, followed by {} more unprocessed bytes",
             self.invalid_sequence,
+            self.valid_byte_sum,
             self.remaining_input.len(),
         )
     }
@@ -127,6 +129,7 @@ impl StringCollector {
                     }
                     Err(invalid) => {
                         return Err(DecodeError {
+                            valid_byte_sum: self.data.len(),
                             // TODO array for invalid data from previous
                             invalid_sequence: Cow::Owned(invalid.to_vec()),
                             remaining_input: rest
@@ -153,6 +156,7 @@ impl StringCollector {
                         Some(invalid_sequence_length) => {
                             let (invalid, remaining_input) = after_valid.split_at(invalid_sequence_length);
                             Err(DecodeError {
+                                valid_byte_sum: self.data.len(),
                                 invalid_sequence: Cow::Borrowed(invalid),
                                 remaining_input
                             })
