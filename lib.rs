@@ -6,6 +6,19 @@ pub struct DecodeError<'input> {
     pub remaining_input: &'input [u8],
 }
 
+impl<'a> std::fmt::Display for DecodeError<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "found invalid byte sequence {:02x?} followed by {} more unprocessed bytes",
+            self.invalid_sequence,
+            self.remaining_input.len(),
+        )
+    }
+}
+
+impl<'a> std::error::Error for DecodeError<'a> {}
+
 #[derive(Debug, Copy, Clone)]
 pub struct Incomplete {
     pub buffer: [u8; 4],
