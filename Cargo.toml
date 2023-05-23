@@ -1,0 +1,8 @@
+[package]
+name = "string-collect"
+version = "0.1.0"
+edition = "2021"
+authors = ["stackinspector"]
+
+[lib]
+path = "lib.rs"
