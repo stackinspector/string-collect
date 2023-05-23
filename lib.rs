@@ -1,92 +1,15 @@
-use std::cmp;
-use std::error::Error;
-use std::fmt;
-use std::str;
+use std::{cmp, str, borrow::Cow};
 
-#[derive(Debug, Copy, Clone)]
-pub enum DecodeError<'a> {
-    /// In lossy decoding insert `valid_prefix`, then `"\u{FFFD}"`,
-    /// then call `decode()` again with `remaining_input`.
-    Invalid {
-        valid_prefix: &'a str,
-        invalid_sequence: &'a [u8],
-        remaining_input: &'a [u8],
-    },
-
-    /// Call the `incomplete_suffix.try_complete` method with more input when available.
-    /// If no more input is available, this is an invalid byte sequence.
-    Incomplete {
-        valid_prefix: &'a str,
-        incomplete_suffix: Incomplete,
-    },
+#[derive(Debug, Clone)]
+pub struct DecodeError<'input> {
+    pub invalid_sequence: Cow<'input, [u8]>,
+    pub remaining_input: &'input [u8],
 }
-
-impl<'a> fmt::Display for DecodeError<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            DecodeError::Invalid {
-                valid_prefix,
-                invalid_sequence,
-                remaining_input,
-            } => write!(
-                f,
-                "found invalid byte sequence {invalid_sequence:02x?} after \
-                    {valid_byte_count} valid bytes, followed by {unprocessed_byte_count} more \
-                    unprocessed bytes",
-                invalid_sequence = invalid_sequence,
-                valid_byte_count = valid_prefix.len(),
-                unprocessed_byte_count = remaining_input.len()
-            ),
-            DecodeError::Incomplete {
-                valid_prefix,
-                incomplete_suffix,
-            } => write!(
-                f,
-                "found incomplete byte sequence {incomplete_suffix:02x?} after \
-                    {valid_byte_count} bytes",
-                incomplete_suffix = incomplete_suffix,
-                valid_byte_count = valid_prefix.len()
-            ),
-        }
-    }
-}
-
-impl<'a> Error for DecodeError<'a> {}
 
 #[derive(Debug, Copy, Clone)]
 pub struct Incomplete {
     pub buffer: [u8; 4],
     pub buffer_len: u8,
-}
-
-pub fn decode(input: &[u8]) -> Result<&str, DecodeError> {
-    let error = match str::from_utf8(input) {
-        Ok(valid) => return Ok(valid),
-        Err(error) => error,
-    };
-
-    // FIXME: separate function from here to guide inlining?
-    let (valid, after_valid) = input.split_at(error.valid_up_to());
-    let valid = unsafe {
-        str::from_utf8_unchecked(valid)
-    };
-
-    match error.error_len() {
-        Some(invalid_sequence_length) => {
-            let (invalid, rest) = after_valid.split_at(invalid_sequence_length);
-            Err(DecodeError::Invalid {
-                valid_prefix: valid,
-                invalid_sequence: invalid,
-                remaining_input: rest
-            })
-        }
-        None => {
-            Err(DecodeError::Incomplete {
-                valid_prefix: valid,
-                incomplete_suffix: Incomplete::new(after_valid),
-            })
-        }
-    }
 }
 
 impl Incomplete {
@@ -95,7 +18,7 @@ impl Incomplete {
         let len = bytes.len();
         buffer[..len].copy_from_slice(bytes);
         Incomplete {
-            buffer: buffer,
+            buffer,
             buffer_len: len as u8,
         }
     }
@@ -104,8 +27,7 @@ impl Incomplete {
     ///   If no more input is available, this is invalid byte sequence.
     /// * `Some((result, remaining_input))`: We’re done with this `Incomplete`.
     ///   To keep decoding, pass `remaining_input` to `decode()`.
-    pub fn try_complete<'input>(&mut self, input: &'input [u8])
-                                -> Option<(Result<&str, &[u8]>, &'input [u8])> {
+    pub fn try_complete<'input>(&mut self, input: &'input [u8]) -> Option<(Result<&str, &[u8]>, &'input [u8])> {
         let (consumed, opt_result) = self.try_complete_offsets(input);
         let result = opt_result?;
         let remaining_input = &input[consumed..];
@@ -118,7 +40,7 @@ impl Incomplete {
     }
 
     fn take_buffer(&mut self) -> &[u8] {
-        let len = self.buffer_len as usize;
+        let len = self.buffer_len;
         self.buffer_len = 0;
         &self.buffer[..len as usize]
     }
@@ -182,16 +104,21 @@ impl StringCollector {
             .saturating_add(self.incomplete.map(|i| i.buffer_len as usize).unwrap_or(0))
     }
 
-    pub fn extend<T: AsRef<[u8]>>(&mut self, tail: T) -> Result<(), ()> {
-        let mut input: &[u8] = tail.as_ref();
-
+    pub fn extend<'input>(&mut self, mut input: &'input [u8]) -> Result<(), DecodeError<'input>> {
         if let Some(mut incomplete) = self.incomplete.take() {
             if let Some((result, rest)) = incomplete.try_complete(input) {
-                input = rest;
-                if let Ok(text) = result {
-                    self.data.push_str(text);
-                } else {
-                    return Err(());
+                match result {
+                    Ok(vaild) => {
+                        self.data.push_str(vaild);
+                        input = rest;
+                    }
+                    Err(invalid) => {
+                        return Err(DecodeError {
+                            // TODO array for invalid data from previous
+                            invalid_sequence: Cow::Owned(invalid.to_vec()),
+                            remaining_input: rest
+                        });
+                    }
                 }
             } else {
                 input = &[];
@@ -200,31 +127,39 @@ impl StringCollector {
         }
 
         if !input.is_empty() {
-            match decode(input) {
-                Ok(text) => {
-                    self.data.push_str(text);
+            match str::from_utf8(input) {
+                Ok(valid) => {
+                    self.data.push_str(valid);
                     Ok(())
-                }
-                Err(DecodeError::Incomplete { valid_prefix, incomplete_suffix }) => {
-                    self.data.push_str(valid_prefix);
-                    self.incomplete = Some(incomplete_suffix);
-                    Ok(())
-                }
-                Err(DecodeError::Invalid { valid_prefix, .. }) => {
-                    self.data.push_str(valid_prefix);
-                    Err(())
-                }
+                },
+                Err(error) => {
+                    let (valid, after_valid) = input.split_at(error.valid_up_to());
+                    self.data.push_str(unsafe { str::from_utf8_unchecked(valid) });
+
+                    match error.error_len() {
+                        Some(invalid_sequence_length) => {
+                            let (invalid, remaining_input) = after_valid.split_at(invalid_sequence_length);
+                            Err(DecodeError {
+                                invalid_sequence: Cow::Borrowed(invalid),
+                                remaining_input
+                            })
+                        }
+                        None => {
+                            self.incomplete = Some(Incomplete::new(after_valid));
+                            Ok(())
+                        }
+                    }
+                },
             }
         } else {
             Ok(())
         }
     }
 
-    pub fn into_string(self) -> Result<String, ()> {
-        if self.incomplete.is_some() {
-            Err(())
-        } else {
-            Ok(self.data)
+    pub fn into_string(self) -> Result<String, (String, Incomplete)> {
+        match self.incomplete {
+            None => Ok(self.data),
+            Some(incomplete) => Err((self.data, incomplete)),
         }
     }
 }
